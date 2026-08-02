@@ -1,0 +1,40 @@
+services:
+  database:
+    image: pgvector/pgvector:pg16
+    container_name: rag_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: mysecretpassword
+      POSTGRES_DB: rag_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  backend:
+    build: ./agentic-rag-backend
+    container_name: rag_backend
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      DB_USER: postgres
+      DB_HOST: database
+      DB_PASSWORD: mysecretpassword
+      DB_NAME: rag_db
+      DB_PORT: 5432
+    depends_on:
+      - database
+  frontend:
+    build: ./agentic-rag-frontend
+    container_name: rag_frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:

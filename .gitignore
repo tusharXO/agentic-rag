@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Environment Variables & Secrets
+.env
+*.env
+
+# Build Output
+dist/
+build/
+
+# Logs & Database Storage
+*.log
+postgres_data/
+
+# OS & Editor Files
+.DS_Store
+.vscode/
+.idea/
