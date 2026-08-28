@@ -73,7 +73,7 @@ async function aiAnswer(contextChunks, question) {
     `;
 
     const response = await ai.models.generateContent({
-        model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+        model: "gemini-3.6-flash",
         contents: prompt,
     })
     return response.text;
