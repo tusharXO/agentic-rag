@@ -1,14 +1,11 @@
-const express = require("express")
-const dotenv = require("dotenv")
-const multer = require("multer")
+require("dotenv").config();
+const express = require("express");
+const multer = require("multer");
 const { PDFParse } = require('pdf-parse');
-const { generateEmbedding } = require("./embedding")
-const pool = require("./db")
+const { generateEmbedding } = require("./embedding");
+const pool = require("./db");
 const { GoogleGenAI } = require("@google/genai");
-const { cat } = require("@xenova/transformers");
-const cors = require("cors")
-
-dotenv.config()
+const cors = require("cors");
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
 
@@ -76,7 +73,7 @@ async function aiAnswer(contextChunks, question) {
     `;
 
     const response = await ai.models.generateContent({
-        model: "gemini-3.6-flash",
+        model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
         contents: prompt,
     })
     return response.text;

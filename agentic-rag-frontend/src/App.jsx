@@ -26,6 +26,8 @@ export default function App() {
   const [chatResult, setChatResult] = useState(null);
   const [searchError, setSearchError] = useState('');
 
+  const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000';
+
   // Handle File Drop / Select
   const handleFileChange = (e) => {
     if (e.target.files && e.target.files[0]) {
@@ -51,7 +53,7 @@ export default function App() {
     setUploadSuccess(false);
 
     try {
-      const response = await axios.post('http://localhost:3000/upload', formData, {
+      const response = await axios.post(`${BACKEND_URL}/upload`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
 
@@ -74,7 +76,7 @@ export default function App() {
     setSearchError('');
 
     try {
-      const response = await axios.post('http://localhost:3000/query', {
+      const response = await axios.post(`${BACKEND_URL}/query`, {
         question: question,
       });
 
