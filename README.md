@@ -36,45 +36,23 @@
 
 ## 🏛️ Architecture & Data Flow
 
-```mermaid
-flowchart TD
-    subgraph Client ["Frontend (React 19 + Vite + Tailwind CSS)"]
-        UI_Upload["📄 Upload PDF Document"]
-        UI_Filter["🎯 Target: All or Specific Document"]
-        UI_Query["💬 Ask Natural Language Question"]
-        UI_Display["✨ View Grounded Answer + Source Citations"]
-    end
+The system has two independent flows that share the same `document_chunks` table:
 
-    subgraph Backend ["Backend API (Express.js)"]
-        PDFParser["PDF Parser (pdf-parse)"]
-        Chunker["Sliding Window Chunker (1000 char / 200 overlap, strips Markdown syntax)"]
-        Embedder["Local ONNX Embedder (all-MiniLM-L6-v2)"]
-        VectorSearch["Cosine Distance Search (<=>)"]
-        GeminiClient["Gemini LLM Prompting (@google/genai, SSE)"]
-    end
+**Ingestion (POST /upload)**
 
-    subgraph Database ["Vector Database (PostgreSQL + pgvector / Supabase)"]
-        DBTable[("document_chunks table (384-dim vectors)")]
-    end
+1. The browser posts a PDF to the Express server.
+2. `pdf-parse` extracts the text.
+3. The chunker splits it into 1000-character windows with 200-character overlap, stripping stray Markdown syntax along the way.
+4. `@xenova/transformers` (`all-MiniLM-L6-v2`) embeds each chunk into a 384-dim vector locally.
+5. Chunks + vectors are upserted into `document_chunks` keyed by `session_id` and `filename`.
 
-    subgraph External ["Google AI"]
-        GeminiAPI["Google Gemini Flash (configurable via GEMINI_MODEL)"]
-    end
+**Query (POST /query, SSE streamed)**
 
-    %% Ingestion Flow
-    UI_Upload -->|POST /upload| PDFParser
-    PDFParser --> Chunker
-    Chunker --> Embedder
-    Embedder -->|Store chunks & vectors by session_id| DBTable
-
-    %% Query Flow
-    UI_Query -->|POST /query (sessionId, question, filename)| Embedder
-    Embedder -->|Generate query vector| VectorSearch
-    DBTable <-->|Retrieve Top-3 Cosine Matches| VectorSearch
-    VectorSearch -->|Context Chunks + Question| GeminiClient
-    GeminiClient <-->|Strictly Grounded Synthesis| GeminiAPI
-    GeminiClient -->|SSE: sources → token* → done| UI_Display
-```
+1. The browser POSTs `{ question, sessionId, filename? }`.
+2. The same local embedder generates a vector for the question.
+3. Postgres runs a top-3 cosine-distance search (`<=>`) against `document_chunks`, optionally filtered by `filename`.
+4. The retrieved chunks are stuffed into a grounding prompt and sent to Gemini.
+5. Gemini's response is streamed back to the browser as `event: sources` once, followed by one or more `event: token` events, then `event: done` (or `event: error`).
 
 ---
 
