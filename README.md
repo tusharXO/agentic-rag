@@ -22,13 +22,15 @@
 
 ## ✨ Key Features
 
-- ⚡ **Local 384-Dim Vector Embeddings**: Uses `@xenova/transformers` (`all-MiniLM-L6-v2` ONNX pipeline) to compute dense vector embeddings directly in Node.js with zero API latency or embedding costs.
-- 🛡️ **Multi-Tenant Session Isolation**: Automatic, persistent workspace `sessionId` so each user's uploaded documents and queries remain strictly private and isolated.
-- 🗄️ **Vector Database with `pgvector`**: Stores document chunks and high-dimensional vectors in PostgreSQL using native cosine distance indexing (`<=>`).
-- 🤖 **Grounded AI Answers via Gemini**: Queries Google Gemini (`@google/genai`) with strict context-bounding system instructions to prevent hallucinations.
-- 📂 **Live Document Library & File Manager**: Fetch, view chunk stats, filter queries by single or multiple files, and delete documents in real-time.
-- 💾 **Persistent Chat & Workspace Switcher**: Chat progress and query history are preserved across browser refreshes with 1-click workspace sharing/loading.
-- 🎨 **Modern Glassmorphic Dark UI**: High-end interface built with React 19, Tailwind CSS v4, Lucide icons, responsive layout, and collapsible source citations.
+- **Local 384-Dim Vector Embeddings**: Uses `@xenova/transformers` (`all-MiniLM-L6-v2` ONNX pipeline) to compute dense vector embeddings directly in Node.js with zero API latency or embedding costs.
+- **Multi-Tenant Session Isolation**: Automatic, persistent workspace `sessionId` so each user's uploaded documents and queries remain strictly private and isolated.
+- **Vector Database with `pgvector`**: Stores document chunks and high-dimensional vectors in PostgreSQL using native cosine distance indexing (`<=>`).
+- **Grounded AI Answers via Gemini**: Queries Google Gemini (`@google/genai`) with strict context-bounding system instructions to prevent hallucinations.
+- **Live Document Library & File Manager**: Fetch, view chunk stats, filter queries by single or multiple files, and delete documents in real-time.
+- **Persistent Chat & Workspace Switcher**: Chat progress and query history are preserved across browser refreshes with 1-click workspace sharing/loading.
+- **Server-Sent Events Streaming**: `/query` streams Gemini's response token-by-token over SSE, so the first word appears in under a second instead of waiting for the full answer.
+- **Markdown-Aware Chunking**: The text splitter strips stray Markdown syntax (asterisks, bold, code backticks, link brackets) from PDFs so the LLM doesn't echo formatting back as visible asterisks.
+- **Minimalist Dark UI**: Clean, responsive React 19 + Tailwind CSS v4 + Lucide interface with collapsible source citations, mobile slide-in drawer, and WCAG-friendly focus rings.
 
 ---
 
@@ -45,10 +47,10 @@ flowchart TD
 
     subgraph Backend ["Backend API (Express.js)"]
         PDFParser["PDF Parser (pdf-parse)"]
-        Chunker["Sliding Window Chunker (1000 char / 200 overlap)"]
+        Chunker["Sliding Window Chunker (1000 char / 200 overlap, strips Markdown syntax)"]
         Embedder["Local ONNX Embedder (all-MiniLM-L6-v2)"]
         VectorSearch["Cosine Distance Search (<=>)"]
-        GeminiClient["Gemini LLM Prompting (@google/genai)"]
+        GeminiClient["Gemini LLM Prompting (@google/genai, SSE)"]
     end
 
     subgraph Database ["Vector Database (PostgreSQL + pgvector / Supabase)"]
@@ -56,7 +58,7 @@ flowchart TD
     end
 
     subgraph External ["Google AI"]
-        GeminiAPI["Google Gemini 3.6 / 2.5 Flash"]
+        GeminiAPI["Google Gemini Flash (configurable via GEMINI_MODEL)"]
     end
 
     %% Ingestion Flow
@@ -71,7 +73,7 @@ flowchart TD
     DBTable <-->|Retrieve Top-3 Cosine Matches| VectorSearch
     VectorSearch -->|Context Chunks + Question| GeminiClient
     GeminiClient <-->|Strictly Grounded Synthesis| GeminiAPI
-    GeminiClient -->|Answer + Citations| UI_Display
+    GeminiClient -->|SSE: sources → token* → done| UI_Display
 ```
 
 ---
@@ -110,7 +112,20 @@ agentic-rag/
 
 ---
 
-### 2. Option A: Run with Docker Compose (Fastest)
+### 2. Backend environment variables
+
+| Variable | Required | Default | Purpose |
+| :--- | :--- | :--- | :--- |
+| `GEMINI_API_KEY` | ✅ | — | Google AI Studio key. |
+| `GEMINI_MODEL` | — | `gemini-3.6-flash` | Override the Gemini model. If the model name is invalid, the backend returns an error instead of silently falling back. |
+| `GEMINI_MAX_OUTPUT_TOKENS` | — | `800` | Cap on the streamed answer length. Lower for snappier first tokens. |
+| `DATABASE_URL` | —* | — | Full Postgres URI (Supabase / hosted). |
+| `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME` | —* | — | Discrete Postgres connection vars (Docker / local). |
+| `PORT` | — | `3000` | HTTP port. |
+
+\* One of `DATABASE_URL` or the discrete `DB_*` set is required.
+
+### 3. Option A: Run with Docker Compose (Fastest)
 
 1. Clone this repository:
    ```bash
@@ -132,7 +147,7 @@ agentic-rag/
 
 ---
 
-### 3. Option B: Run Locally without Docker
+### 4. Option B: Run Locally without Docker
 
 #### Backend Setup
 ```bash
@@ -234,7 +249,18 @@ Open `http://localhost:5173` in your browser.
 | `GET` | `/files` | Query: `?sessionId=xyz` | Lists all documents uploaded under the specified session ID. |
 | `DELETE` | `/files/:filename` | Query: `?sessionId=xyz` | Deletes the specified file and all associated vector chunks. |
 | `POST` | `/upload` | Multipart: `file` (PDF), `sessionId` | Extracts text, generates 384-dim vectors, and saves chunks to PostgreSQL. |
-| `POST` | `/query` | JSON: `{ question, sessionId, filename? }` | Computes question vector, finds top cosine matches in pgvector, and synthesizes answer with Gemini. |
+| `POST` | `/query` | JSON: `{ question, sessionId, filename? }` | Computes the question vector, retrieves the top-3 cosine matches from pgvector, and streams the Gemini answer back over **Server-Sent Events**. See the wire format below. |
+
+### `/query` SSE wire format
+
+`/query` returns `Content-Type: text/event-stream`. Each event is `event: <name>\ndata: <json>\n\n`:
+
+| Event | Data | When |
+| :--- | :--- | :--- |
+| `sources` | `{ targetDocument, sources: [{ id, filename, chunkIndex, content, similarity }] }` | Sent once at the start with the retrieved chunks for the citation drawer. |
+| `token` | `{ t: "<text delta>" }` | Streamed one or more times as Gemini produces output. |
+| `done` | `{}` | Sent when the answer stream completes successfully. |
+| `error` | `{ error: "<message>" }` | Sent if no documents are loaded, no matches are found, or the LLM call fails. |
 
 ---
 
