@@ -48,19 +48,101 @@ async function initDatabase() {
 initDatabase();
 
 function chunkText(text, chunkSize = 1000, overlap = 200) {
+    // Normalize whitespace, then strip stray Markdown formatting that often
+    // leaks into PDFs exported from Markdown sources (Pandoc, slide tools,
+    // etc.). We keep the readable text but drop the syntax that would
+    // otherwise echo back into Gemini's output and confuse retrieval.
+    const cleanText = text
+        .replace(/\r\n/g, '\n')
+        .replace(/[ \t]+/g, ' ')
+        // Collapse 3+ blank lines into a single paragraph break.
+        .replace(/\n{3,}/g, '\n\n')
+        // Strip leading Markdown bullets / list markers at the start of a line.
+        .replace(/^\s*[*\-+]\s+/gm, '')
+        // Strip Markdown bold / italic markers.
+        .replace(/\*\*([^*]+)\*\*/g, '$1')
+        .replace(/\*([^*]+)\*/g, '$1')
+        .replace(/__([^_]+)__/g, '$1')
+        .replace(/(?<!\w)_([^_]+)_(?!\w)/g, '$1')
+        // Strip inline code backticks (keep contents).
+        .replace(/`([^`]+)`/g, '$1')
+        // Strip Markdown link syntax, keep the label.
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+        .trim();
+    if (!cleanText) return [];
+
+    const paragraphs = cleanText
+        .split(/\n{2,}/)
+        .map(p => p.trim())
+        .filter(Boolean);
+
     const chunks = [];
-    let start = 0;
+    let current = '';
 
-    // Clean whitespace
-    const cleanText = text.replace(/\r\n/g, '\n').replace(/[ \t]+/g, ' ').trim();
+    const flush = () => {
+        if (current.trim().length === 0) return;
+        chunks.push(current.trim());
+        const tail = current.trim().slice(-overlap);
+        current = tail;
+    };
 
-    while (start < cleanText.length) {
-        const end = start + chunkSize;
-        chunks.push(cleanText.slice(start, end));
-        start += (chunkSize - overlap);
+    for (const paragraph of paragraphs) {
+        if (paragraph.length <= chunkSize) {
+            if (current.length === 0) {
+                current = paragraph;
+            } else if (current.length + 2 + paragraph.length <= chunkSize) {
+                current = current + '\n\n' + paragraph;
+            } else {
+                flush();
+                current = (current ? current + '\n\n' : '') + paragraph;
+            }
+            continue;
+        }
+
+        flush();
+        const sentenceParts = splitLongParagraph(paragraph, chunkSize, overlap);
+        for (const part of sentenceParts) {
+            if (current.length === 0) {
+                current = part;
+            } else if (current.length + 2 + part.length <= chunkSize) {
+                current = current + '\n\n' + part;
+            } else {
+                flush();
+                current = part;
+            }
+        }
     }
 
-    return chunks;
+    flush();
+    return chunks.filter(c => c.length > 0);
+}
+
+
+function splitLongParagraph(paragraph, chunkSize, overlap) {
+    const sentenceRegex = /[^.!?]+[.!?]+(?=\s+[A-Z]|$)|[^.!?]+$/g;
+    const sentences = paragraph.match(sentenceRegex) || [paragraph];
+    const pieces = [];
+
+    for (const sentence of sentences) {
+        const trimmed = sentence.trim();
+        if (!trimmed) continue;
+
+        if (trimmed.length <= chunkSize) {
+            pieces.push(trimmed);
+            continue;
+        }
+
+        // Single sentence longer than chunkSize — hard-slice it.
+        let start = 0;
+        while (start < trimmed.length) {
+            const end = Math.min(start + chunkSize, trimmed.length);
+            pieces.push(trimmed.slice(start, end));
+            if (end >= trimmed.length) break;
+            start = end - overlap;
+        }
+    }
+
+    return pieces;
 }
 
 async function saveDocumentChunks(filename, chunkObject, sessionId = 'default') {
@@ -68,7 +150,6 @@ async function saveDocumentChunks(filename, chunkObject, sessionId = 'default') 
 
     try {
         await client.query('BEGIN');
-        // Delete previous versions of this document uploaded by this session
         await client.query('DELETE FROM document_chunks WHERE filename = $1 AND session_id = $2;', [filename, sessionId]);
         
         const insertSql = 'INSERT INTO document_chunks (filename, chunk_index, content, embedding, session_id, created_at) VALUES($1, $2, $3, $4, $5, NOW())';
@@ -92,10 +173,13 @@ async function saveDocumentChunks(filename, chunkObject, sessionId = 'default') 
     }
 }
 
-async function aiAnswer(contextChunks, question) {
-    const formattedContext = contextChunks.map((chunk, i) => `[Source Chunk ${i + 1} (${chunk.filename || 'Document'})]:\n${chunk.content || chunk}`).join('\n\n');
+// Build the grounding prompt used for both streaming and non-streaming calls.
+function buildPrompt(contextChunks, question) {
+    const formattedContext = contextChunks
+        .map((chunk, i) => `[Source Chunk ${i + 1} (${chunk.filename || 'Document'})]:\n${chunk.content || chunk}`)
+        .join('\n\n');
 
-    const prompt = `
+    return `
 You are an intelligent, precise AI research assistant. Answer the user's question accurately and concisely based STRICTLY on the provided context below.
 - Do NOT make assumptions or hallucinate information not present in the context.
 - If the answer cannot be determined directly from the context, respond with: "I cannot answer this question based on the provided document(s)."
@@ -107,23 +191,33 @@ ${formattedContext}
 QUESTION:
 ${question}
 `;
+}
 
-    const modelName = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+// Resolve which Gemini model to call. Override via GEMINI_MODEL env var.
+function getModelName() {
+    return process.env.GEMINI_MODEL || "gemini-3.6-flash";
+}
 
-    try {
-        const response = await ai.models.generateContent({
-            model: modelName,
-            contents: prompt,
-        });
-        return response.text;
-    } catch (err) {
-        console.warn(`Gemini generation with '${modelName}' failed, trying fallback:`, err.message);
-        // Fallback to gemini-1.5-flash or gemini-2.0-flash if configured model throws error
-        const fallbackResponse = await ai.models.generateContent({
-            model: "gemini-3.6-flash",
-            contents: prompt,
-        });
-        return fallbackResponse.text;
+// Stream Gemini's response token-by-token. Yields string chunks as they
+// arrive. Errors propagate to the caller.
+async function* streamAnswer(contextChunks, question) {
+    const prompt = buildPrompt(contextChunks, question);
+    const response = await ai.models.generateContentStream({
+        model: getModelName(),
+        contents: prompt,
+        // Cap output length so a single response can't run for 15+ seconds.
+        // Adjust via env if you want longer answers; default keeps first-token
+        // latency under ~2s for typical context sizes.
+        config: {
+            maxOutputTokens: parseInt(process.env.GEMINI_MAX_OUTPUT_TOKENS || '800', 10),
+        },
+    });
+    for await (const chunk of response) {
+        // Each chunk may contain a partial `text` field; concatenate and yield.
+        const text = chunk.text
+            || chunk.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('')
+            || '';
+        if (text) yield text;
     }
 }
 
@@ -254,49 +348,70 @@ app.post("/upload", upload.single('file'), async (req, res) => {
     }
 });
 
-// POST /query - Semantic search and LLM synthesis
+// POST /query - Semantic search and LLM synthesis (SSE streamed)
+//
+// Wire format (text/event-stream):
+//   event: sources\n data: <json with sources + targetDocument>\n\n
+//   event: token\n   data: {"t": "<text delta>"}\n\n        (one or more)
+//   event: done\n    data: {}\n\n
+//   event: error\n   data: {"error": "<message>"}\n\n
 app.post("/query", async (req, res) => {
+    if (!req.body || !req.body.question || !req.body.question.trim()) {
+        return res.status(400).json({ error: "Property 'question' is required in request body." });
+    }
+
+    const question = req.body.question.trim();
+    const sessionId = req.body.sessionId || req.headers['x-session-id'] || 'default';
+    const filename = req.body.filename ? req.body.filename.trim() : null;
+
+    // SSE headers
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    const sendEvent = (event, data) => {
+        res.write(`event: ${event}\n`);
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+    };
+
+    // SSE comment line — defeats intermediate buffering on most proxies
+    // (nginx, Render, etc.) and keeps the connection warm. Sent once at
+    // the start; the browser ignores comment lines.
+    res.write(`: connected ${Date.now()}\n\n`);
+
     try {
-        if (!req.body || !req.body.question || !req.body.question.trim()) {
-            return res.status(400).json({ error: "Property 'question' is required in request body." });
-        }
-
-        const question = req.body.question.trim();
-        const sessionId = req.body.sessionId || req.headers['x-session-id'] || 'default';
-        const filename = req.body.filename ? req.body.filename.trim() : null;
-
-        // Check if any documents exist for this session
+        // Verify the session has any documents at all.
         const countCheck = await pool.query(
             'SELECT COUNT(*) FROM document_chunks WHERE session_id = $1;',
             [sessionId]
         );
 
         if (parseInt(countCheck.rows[0].count, 10) === 0) {
-            return res.status(404).json({
-                error: "No documents found in your library. Please upload a PDF document before asking questions."
-            });
+            sendEvent('error', { error: "No documents found in your library. Please upload a PDF document before asking questions." });
+            return res.end();
         }
 
         const queryEmbedding = await generateEmbedding(question);
 
-        let sqlQuery = "";
-        let sqlValues = [];
-
+        let sqlQuery;
+        let sqlValues;
         if (filename && filename !== 'ALL') {
             sqlQuery = `
-                SELECT id, filename, chunk_index, content, (embedding <=> $1) AS distance 
-                FROM document_chunks 
+                SELECT id, filename, chunk_index, content, (embedding <=> $1) AS distance
+                FROM document_chunks
                 WHERE session_id = $2 AND filename = $3
-                ORDER BY distance ASC 
+                ORDER BY distance ASC
                 LIMIT 3;
             `;
             sqlValues = [JSON.stringify(queryEmbedding), sessionId, filename];
         } else {
             sqlQuery = `
-                SELECT id, filename, chunk_index, content, (embedding <=> $1) AS distance 
-                FROM document_chunks 
+                SELECT id, filename, chunk_index, content, (embedding <=> $1) AS distance
+                FROM document_chunks
                 WHERE session_id = $2
-                ORDER BY distance ASC 
+                ORDER BY distance ASC
                 LIMIT 3;
             `;
             sqlValues = [JSON.stringify(queryEmbedding), sessionId];
@@ -305,11 +420,12 @@ app.post("/query", async (req, res) => {
         const result = await pool.query(sqlQuery, sqlValues);
 
         if (result.rows.length === 0) {
-            return res.status(404).json({
-                error: filename 
-                    ? `No relevant content found in '${filename}'.` 
+            sendEvent('error', {
+                error: filename
+                    ? `No relevant content found in '${filename}'.`
                     : "No matching document content found."
             });
+            return res.end();
         }
 
         const contextChunks = result.rows.map(row => ({
@@ -320,11 +436,9 @@ app.post("/query", async (req, res) => {
             distance: parseFloat(row.distance)
         }));
 
-        const answer = await aiAnswer(contextChunks, question);
-
-        return res.status(200).json({
-            query: question,
-            answer: answer,
+        // Send the sources up front so the UI can render the citation
+        // drawer immediately, then start streaming the answer.
+        sendEvent('sources', {
             targetDocument: filename || "ALL",
             sources: contextChunks.map(c => ({
                 id: c.id,
@@ -335,9 +449,25 @@ app.post("/query", async (req, res) => {
             }))
         });
 
+        // Tear down the stream if the client disconnects mid-generation.
+        let aborted = false;
+        req.on('close', () => { aborted = true; });
+
+        for await (const text of streamAnswer(contextChunks, question)) {
+            if (aborted) break;
+            sendEvent('token', { t: text });
+        }
+
+        sendEvent('done', {});
+        return res.end();
     } catch (error) {
         console.error("Query error:", error);
-        return res.status(500).json({ error: error.message || "Failed to process query and generate answer." });
+        try {
+            sendEvent('error', { error: error.message || "Failed to process query and generate answer." });
+            res.end();
+        } catch {
+            // Connection already closed; nothing more to do.
+        }
     }
 });
 
